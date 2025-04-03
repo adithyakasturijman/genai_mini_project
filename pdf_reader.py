@@ -28,19 +28,19 @@ genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 local_storage = LocalStorage()
 
-if "chat_sess" not in st.session_state:
+if "chat_sessions" not in st.session_state:
     st.session_state.chat_sessions = {}  
 
-if "curr_chat_id" not in st.session_state:
+if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None  
 
 
 def load_chat_history():
     saved_chats = local_storage.getItem("local")
     if saved_chats:
-        st.session_state.chat_sess = json.loads(saved_chats)
-        if st.session_state.chat_sess:
-            st.session_state.curr_chat_id = list(st.session_state.chat_sess.keys())[-1]
+        st.session_state.chat_sessions = json.loads(saved_chats)
+        if st.session_state.chat_sessions:
+            st.session_state.current_chat_id = list(st.session_state.chat_sessions.keys())[-1]
 
 
 def generate_new_chat(Chat_name=None):
@@ -49,39 +49,39 @@ def generate_new_chat(Chat_name=None):
 
     new_chat_id = str(uuid.uuid4())
 
-    st.session_state.chat_sess[new_chat_id] = {
+    st.session_state.chat_sessions[new_chat_id] = {
         "history": [],
         "context_sources": [],
         "context_type": None,
         "Chat Name": Chat_name
     }
 
-    st.session_state.curr_chat_id = new_chat_id
+    st.session_state.current_chat_id = new_chat_id
 
-    local_storage.setItem("local", json.dumps(st.session_state.chat_sess), key="setting_sessions")
+    local_storage.setItem("local", json.dumps(st.session_state.chat_sessions), key="setting_sessions")
     
     st.rerun()
 
 
 def switch_chat(chat_id):
-    st.session_state.curr_chat_id = chat_id
+    st.session_state.current_chat_id = chat_id
 
 
 def store_message(role, content):
-    if st.session_state.curr_chat_id:
-        chat_id = st.session_state.curr_chat_id
-        st.session_state.chat_sess[chat_id]["history"].append({"role": role, "content": content})
+    if st.session_state.current_chat_id:
+        chat_id = st.session_state.current_chat_id
+        st.session_state.chat_sessions[chat_id]["history"].append({"role": role, "content": content})
 
         # Generate a truly unique key using timestamp and a random component
         unique_key = f"storing_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         
-        local_storage.setItem("local", json.dumps(st.session_state.chat_sess), key=unique_key)
+        local_storage.setItem("local", json.dumps(st.session_state.chat_sessions), key=unique_key)
 
 
 def display_chat_history():
-    chat_id = st.session_state.curr_chat_id
-    if chat_id and chat_id in st.session_state.chat_sess:
-        for message in st.session_state.chat_sess[chat_id]["history"]:
+    chat_id = st.session_state.current_chat_id
+    if chat_id and chat_id in st.session_state.chat_sessions:
+        for message in st.session_state.chat_sessions[chat_id]["history"]:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
@@ -163,15 +163,13 @@ def vectorsearch(user_query):
         query_embedding = response["embedding"]
 
         response = supabase.rpc(
-            "match_documents",
+            "similarity_retrival",
             {
                 "query_embedding": query_embedding,
                 "match_threshold": 0.5,
                 "match_count": 5
             }
         ).execute()
-
-        # Filter the results to only return text from the same hash
 
         return response
 
@@ -202,14 +200,22 @@ def get_llm_chain():
 
 
 def user_prompt(prompt, pdf_names):
-    response = vectorsearch(prompt)  # Pass hash to filter correct results
-    relevant_chunks = [row["text"] for row in response.data if response["source_name"] not in pdf_names]
+    response = vectorsearch(prompt)
+    # Get relevant chunks FROM the uploaded PDFs along with their source information
+    relevant_chunks_with_sources = [
+        {"text": row["text"], "source": row["source_name"]} 
+        for row in response.data if row.get("source_name") in pdf_names
+    ]
+    
+    # Extract just the text for the LLM
+    relevant_chunks = [item["text"] for item in relevant_chunks_with_sources]
+    
     chain = get_llm_chain()
     
     if not relevant_chunks:
-        st.write("Reply: No context provided in this PDF for that word.")
-        return
+        return "Reply: No context provided in this PDF for that query.", []
 
+    # Pass just the text to the LLM
     response = chain(
         {
             "context": "\n".join(relevant_chunks),
@@ -217,9 +223,12 @@ def user_prompt(prompt, pdf_names):
         },
         return_only_outputs=True
     )
-    return response.get("text", "No valid response")
+    
+    # Return both the response and the sources
+    return response.get("text", "No valid response"), relevant_chunks_with_sources
 
 
+# Modify the PDF chatbot function to display sources
 def pdf_chatbot():
     st.header("📄 PDF Chatbot")
 
@@ -233,10 +242,10 @@ def pdf_chatbot():
         if not st.session_state.current_chat_id:
             generate_new_chat(pdf_docs[0].name)
 
-        chat_id = st.session_state.curr_chat_id
+        chat_id = st.session_state.current_chat_id
 
-        if not st.session_state.chat_sess[chat_id]["Chat Name"] or st.session_state.chat_sess[chat_id]["Chat Name"] != pdf_docs[0].name:
-            st.session_state.chat_sess[chat_id]["Chat Name"] = pdf_docs[0].name
+        if not st.session_state.chat_sessions[chat_id]["Chat Name"] or st.session_state.chat_sessions[chat_id]["Chat Name"] != pdf_docs[0].name:
+            st.session_state.chat_sessions[chat_id]["Chat Name"] = pdf_docs[0].name
 
         with st.spinner("Processing..."):
             raw_texts = get_pdf_text(pdf_docs)
@@ -251,8 +260,8 @@ def pdf_chatbot():
                 store_vectors_in_db(text_chunks, i["source_name"])
 
             st.success("PDF processed successfully! You can now chat with it.")
-            st.session_state.chat_sess[chat_id]["context_sources"] = pdf_names
-            st.session_state.chat_sess[chat_id]["context_type"] = "pdf"
+            st.session_state.chat_sessions[chat_id]["context_sources"] = pdf_names
+            st.session_state.chat_sessions[chat_id]["context_type"] = "pdf"
 
     display_chat_history()
 
@@ -261,22 +270,35 @@ def pdf_chatbot():
     if user_query:
         store_message("user", user_query)
         st.chat_message("user").markdown(user_query)
-        chat_id = st.session_state.curr_chat_id
+        chat_id = st.session_state.current_chat_id
 
-        if not st.session_state.chat_sess[chat_id].get("context_sources"):
+        if not st.session_state.chat_sessions[chat_id].get("context_sources"):
             with st.chat_message("assistant"):
                 st.markdown("Please upload and process a PDF first.")
             store_message("assistant", "Please upload and process a PDF first.")
         else:
-            pdf_names = st.session_state.chat_sess[chat_id]["context_sources"]
-            bot_response = user_prompt(user_query, pdf_names)
+            pdf_names = st.session_state.chat_sessions[chat_id]["context_sources"]
+            bot_response, sources = user_prompt(user_query, pdf_names)
 
             if bot_response:
-                store_message("assistant", bot_response)
+                # Create a formatted response with sources
+                formatted_response = f"{bot_response}\n\n---\n\n**Sources:**\n"
+                
+                # Add unique sources to avoid repetition
+                unique_sources = set()
+                for source in sources:
+                    unique_sources.add(source["source"])
+                
+                # Add each unique source to the response
+                for source in unique_sources:
+                    formatted_response += f"- {source}\n"
+                
+                store_message("assistant", formatted_response)
                 with st.chat_message("assistant"):
-                    st.markdown(bot_response)
+                    st.markdown(formatted_response)
 
 
+# Similarly modify the domain chatbot function
 def domain_chatbot():
     st.header("🌍 Domain Chatbot")
 
@@ -297,22 +319,24 @@ def domain_chatbot():
             raw_text = " ".join(resp.stripped_strings)
             text_chunks = get_text_chunks(raw_text)
 
-            domain_hash = generate_hash("\n".join(text_chunks))
+            # Use the domain as the source name
+            source_name = domain_link
             
             # Get current chat ID
             chat_id = st.session_state.current_chat_id
             
-            # Set the hash and type
-            st.session_state.chat_sessions[chat_id]["context_hash"] = domain_hash
+            # Set the source and type
+            st.session_state.chat_sessions[chat_id]["context_sources"] = [source_name]
             st.session_state.chat_sessions[chat_id]["context_type"] = "domain"
             
             # Immediately save to local storage to ensure persistence
             unique_key = f"domain_store_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-            local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key=unique_key)
+            local_storage.setItem("local", json.dumps(st.session_state.chat_sessions), key=unique_key)
             
-            # Store vectors in database
-            store_vectors_in_db(text_chunks)
+            # Store vectors in database with source name
+            store_vectors_in_db(text_chunks, source_name)
             st.success("Domain data stored successfully! You can now chat with it.")
+            driver.quit()  # Close the browser
 
     display_chat_history()
 
@@ -324,19 +348,31 @@ def domain_chatbot():
         
         chat_id = st.session_state.current_chat_id
         
-        context_hash = st.session_state.chat_sessions[chat_id].get("context_hash")
+        context_sources = st.session_state.chat_sessions[chat_id].get("context_sources")
         
-        if not context_hash:
+        if not context_sources:
             with st.chat_message("assistant"):
                 st.markdown("Please click 'Store Domain in Database' button first to process the website content.")
             store_message("assistant", "Please click 'Store Domain in Database' button first to process the website content.")
         else:
-            bot_response = user_prompt(user_query, context_hash)
+            bot_response, sources = user_prompt(user_query, context_sources)
             
             if bot_response:
-                store_message("assistant", bot_response)
+                # Create a formatted response with sources
+                formatted_response = f"{bot_response}\n\n---\n\n**Sources:**\n"
+                
+                # Add unique sources to avoid repetition
+                unique_sources = set()
+                for source in sources:
+                    unique_sources.add(source["source"])
+                
+                # Add each unique source to the response
+                for source in unique_sources:
+                    formatted_response += f"- {source}\n"
+                
+                store_message("assistant", formatted_response)
                 with st.chat_message("assistant"):
-                    st.markdown(bot_response)
+                    st.markdown(formatted_response)
 
 
 def main():

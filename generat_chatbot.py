@@ -1,83 +1,85 @@
 import os
 import time
 import streamlit as st
+from PyPDF2 import PdfReader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+from bs4 import BeautifulSoup
+from langchain.prompts import PromptTemplate
+from supabase import create_client, Client
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-import google.generativeai as genai
-from supabase import create_client, Client
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+import hashlib
 from dotenv import load_dotenv
-import uuid
+import uuid  
 from streamlit_local_storage import LocalStorage
 import json
-from main import *
+from pdf_reader import *
 
-# Load environment variables
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Configure API clients
 genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 local_storage = LocalStorage()
 
-# Initialize session state variables
 if "chat_sessions" not in st.session_state:
-    st.session_state.chat_sessions = {}
+    st.session_state.chat_sessions = {}  
 
 if "current_chat_id" not in st.session_state:
-    st.session_state.current_chat_id = None
+    st.session_state.current_chat_id = None  
 
 
 def load_chat_history():
-    """Load saved chat history from local storage"""
-    saved_chats = local_storage.getItem("chat_sessions_local")
+    saved_chats = local_storage.getItem("local")
     if saved_chats:
         st.session_state.chat_sessions = json.loads(saved_chats)
         if st.session_state.chat_sessions:
             st.session_state.current_chat_id = list(st.session_state.chat_sessions.keys())[-1]
 
 
-def generate_new_chat(chat_name=None):
-    """Create a new chat session"""
-    if not chat_name:
-        chat_name = "General Knowledge Chat"
+def generate_new_chat(Chat_name=None):
+    if not Chat_name:
+        Chat_name = "New Chat"
 
     new_chat_id = str(uuid.uuid4())
 
     st.session_state.chat_sessions[new_chat_id] = {
         "history": [],
-        "context_type": "general",
-        "Chat Name": chat_name
+        "context_sources": [],
+        "context_type": None,
+        "Chat Name": Chat_name
     }
 
     st.session_state.current_chat_id = new_chat_id
 
-    local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key="setting_sessions")
+    local_storage.setItem("local", json.dumps(st.session_state.chat_sessions), key="setting_sessions")
+    
     st.rerun()
 
 
 def switch_chat(chat_id):
-    """Switch to an existing chat session"""
     st.session_state.current_chat_id = chat_id
 
 
 def store_message(role, content):
-    """Store a message in the current chat session"""
     if st.session_state.current_chat_id:
         chat_id = st.session_state.current_chat_id
         st.session_state.chat_sessions[chat_id]["history"].append({"role": role, "content": content})
 
-        # Generate a unique key for local storage
+        # Generate a truly unique key using timestamp and a random component
         unique_key = f"storing_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         
-        local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key=unique_key)
+        local_storage.setItem("local", json.dumps(st.session_state.chat_sessions), key=unique_key)
 
 
 def display_chat_history():
-    """Display the current chat history"""
     chat_id = st.session_state.current_chat_id
     if chat_id and chat_id in st.session_state.chat_sessions:
         for message in st.session_state.chat_sessions[chat_id]["history"]:
@@ -85,11 +87,9 @@ def display_chat_history():
                 st.markdown(message["content"])
 
 
-def vectorsearch_all(user_query, limit=5, threshold=0.6):
-    """Search all vectors in the database without filtering by hash"""
+def vectorsearch(user_query):
     genai.configure(api_key=GEMINI_API_KEY) 
 
-    # Get embedding for user query
     response = genai.embed_content(
         model="models/embedding-001",
         content=user_query,
@@ -99,38 +99,29 @@ def vectorsearch_all(user_query, limit=5, threshold=0.6):
     if "embedding" in response:
         query_embedding = response["embedding"]
 
-        # Search for similar chunks across all documents
         response = supabase.rpc(
-            "similarchuncks",
+            "similarity_retrival",
             {
                 "query_embedding": query_embedding,
-                "match_threshold": threshold,
-                "match_count": limit
+                "match_threshold": 0.5,
+                "match_count": 5
             }
         ).execute()
 
-        return response.data if response.data else []
+        return response
 
     return []
 
 
 def get_llm_chain():
-    """Create a LangChain chain for generating responses"""
     prompt_template = """
-    You are a knowledgeable assistant that provides helpful information based on the context provided.
-    Answer the user's question as detailed as possible using the provided context.
-    If the information in the context is insufficient, acknowledge what you know from the context
-    and mention that you have limited information on the topic.
-    
-    Context:
-    {context}
-    
-    Question:
-    {question}
-    
+    Answer the question as detailed as possible from the provided context. If the answer is not available in the context, respond with:
+    'Answer is not available in the context.'
+   
+    Context:\n {context}\n
+    Question:\n {question}\n
     Answer:
     """
-    
     prompt = PromptTemplate(
         input_variables=["context", "question"],
         template=prompt_template
@@ -145,16 +136,46 @@ def get_llm_chain():
     return LLMChain(llm=model, prompt=prompt)
 
 
+def user_prompt(prompt):
+    response = vectorsearch(prompt)
+    relevant_chunks_with_sources = []
+    for row in response.data:
+        dict={}
+        dict["text"]= row["text"]
+        dict["source_name"]= row["source_name"]
+        relevant_chunks_with_sources.append(dict)
+    
+    # Extract just the text for the LLM
+    relevant_chunks = [item["text"] for item in relevant_chunks_with_sources]
+    
+    chain = get_llm_chain()
+    
+    if not relevant_chunks:
+        return "Reply: No context provided in this PDF for that query.", []
+
+    # Pass just the text to the LLM
+    response = chain(
+        {
+            "context": "\n".join(relevant_chunks),
+            "question": prompt
+        },
+        return_only_outputs=True
+    )
+    
+    # Return both the response and the sources
+    return response.get("text", "No valid response"), relevant_chunks_with_sources
+
+
 def general_knowledge_chatbot():
     """Main function for the general knowledge chatbot"""
     st.header("🧠 General Knowledge Chatbot")
     
-    # Clean, modern UI description
-    st.markdown("""
-    <div style="padding: 15px; border-radius: 10px; background-color: #f7f7f7; margin-bottom: 20px;">
-    Ask me anything! I'll search through all stored knowledge to find relevant information.
-    </div>
-    """, unsafe_allow_html=True)
+    # # Clean, modern UI description
+    # st.markdown("""
+    # <div style="padding: 15px; border-radius: 10px; background-color: #f7f7f7; margin-bottom: 20px;">
+    # Ask me anything! I'll search through all stored knowledge to find relevant information.
+    # </div>
+    # """, unsafe_allow_html=True)
     
     # Initialize chat session if needed
     if not st.session_state.current_chat_id:
@@ -173,37 +194,20 @@ def general_knowledge_chatbot():
         
         with st.spinner("Searching knowledge base..."):
             # Retrieve relevant chunks from all documents
-            search_results = vectorsearch_all(user_query)
+            search_results = vectorsearch(user_query)
             
             if not search_results:
                 response = "I don't have enough information in my knowledge base to answer that question confidently."
             else:
-                # Extract text from search results
-                context_texts = []
+                response,relevent_sources = user_prompt(user_query)
                 sources = []
-                
                 # Process search results
-                for result in search_results:
-                    context_texts.append(result["text"])
-                    if "pdf_hash" in result:
-                        sources.append(result["pdf_hash"][:8])  # Use truncated hash as source reference
-                
-                # Get response from LLM
-                chain = get_llm_chain()
-                llm_response = chain(
-                    {
-                        "context": "\n\n".join(context_texts),
-                        "question": user_query
-                    },
-                    return_only_outputs=True
-                )
-                
-                response = llm_response.get("text", "I couldn't generate a response based on the available information.")
-                
+                for result in relevent_sources:
+                    sources.append(result.get("source_name")) 
                 # Add source information if available
                 if sources:
                     unique_sources = list(set(sources))
-                    response += f"\n\n*Information derived from {len(unique_sources)} source(s)*"
+                    response += f"\n\n*Information derived from {unique_sources} source(s)*"
             
             # Store and display assistant response
             store_message("assistant", response)
@@ -219,34 +223,34 @@ def main():
     )
     
     # Custom CSS for a clean, modern look
-    st.markdown("""
-    <style>
-    .main {
-        background-color: #ffffff;
-    }
-    .stApp {
-        max-width: 1600px;
-        margin: 0 auto;
-    }
-    .stButton button {
-        background-color: #4CAF50;
-        color: white;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        font-weight: bold;
-    }
-    h1, h2, h3 {
-        color: #2E4057;
-    }
-    .stSidebar {
-        background-color: #f8f9fa;
-        padding-top: 2rem;
-    }
-    .stTextInput input {
-        border-radius: 8px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    # st.markdown("""
+    # <style>
+    # .main {
+    #     background-color: #000000;
+    # }
+    # .stApp {
+    #     max-width: 1600px;
+    #     margin: 0 auto;
+    # }
+    # .stButton button {
+    #     background-color: #4CAF50;
+    #     color: white;
+    #     border-radius: 8px;
+    #     padding: 0.5rem 1rem;
+    #     font-weight: bold;
+    # }
+    # h1, h2, h3 {
+    #     color: #2E4057;
+    # }
+    # .stSidebar {
+    #     background-color: #f8f9fa;
+    #     padding-top: 2rem;
+    # }
+    # .stTextInput input {
+    #     border-radius: 8px;
+    # }
+    # </style>
+    # """, unsafe_allow_html=True)
     
     # Load chat history
     load_chat_history()
