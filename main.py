@@ -28,19 +28,19 @@ genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 local_storage = LocalStorage()
 
-if "chat_sess" not in st.session_state:
+if "chat_sessions" not in st.session_state:
     st.session_state.chat_sessions = {}  
 
-if "curr_chat_id" not in st.session_state:
+if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None  
 
 
 def load_chat_history():
-    saved_chats = local_storage.getItem("local")
+    saved_chats = local_storage.getItem("chat_sessions_local")
     if saved_chats:
-        st.session_state.chat_sess = json.loads(saved_chats)
-        if st.session_state.chat_sess:
-            st.session_state.curr_chat_id = list(st.session_state.chat_sess.keys())[-1]
+        st.session_state.chat_sessions = json.loads(saved_chats)
+        if st.session_state.chat_sessions:
+            st.session_state.current_chat_id = list(st.session_state.chat_sessions.keys())[-1]
 
 
 def generate_new_chat(Chat_name=None):
@@ -49,39 +49,39 @@ def generate_new_chat(Chat_name=None):
 
     new_chat_id = str(uuid.uuid4())
 
-    st.session_state.chat_sess[new_chat_id] = {
+    st.session_state.chat_sessions[new_chat_id] = {
         "history": [],
-        "context_sources": [],
+        "context_hash": None,
         "context_type": None,
         "Chat Name": Chat_name
     }
 
-    st.session_state.curr_chat_id = new_chat_id
+    st.session_state.current_chat_id = new_chat_id
 
-    local_storage.setItem("local", json.dumps(st.session_state.chat_sess), key="setting_sessions")
+    local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key="setting_sessions")
     
     st.rerun()
 
 
 def switch_chat(chat_id):
-    st.session_state.curr_chat_id = chat_id
+    st.session_state.current_chat_id = chat_id
 
 
 def store_message(role, content):
-    if st.session_state.curr_chat_id:
-        chat_id = st.session_state.curr_chat_id
-        st.session_state.chat_sess[chat_id]["history"].append({"role": role, "content": content})
+    if st.session_state.current_chat_id:
+        chat_id = st.session_state.current_chat_id
+        st.session_state.chat_sessions[chat_id]["history"].append({"role": role, "content": content})
 
         # Generate a truly unique key using timestamp and a random component
         unique_key = f"storing_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         
-        local_storage.setItem("local", json.dumps(st.session_state.chat_sess), key=unique_key)
+        local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key=unique_key)
 
 
 def display_chat_history():
-    chat_id = st.session_state.curr_chat_id
-    if chat_id and chat_id in st.session_state.chat_sess:
-        for message in st.session_state.chat_sess[chat_id]["history"]:
+    chat_id = st.session_state.current_chat_id
+    if chat_id and chat_id in st.session_state.chat_sessions:
+        for message in st.session_state.chat_sessions[chat_id]["history"]:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
@@ -101,14 +101,12 @@ def fetch_content(driver, url):
 
 
 def get_pdf_text(pdf_docs):
-    all_texts = []
     text = ""
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
         for page in pdf_reader.pages:
             text += page.extract_text()
-        all_texts.append({"text": text, "source_name": pdf.name})
-    return all_texts
+    return text
 
 
 def get_text_chunks(text):
@@ -120,13 +118,13 @@ def generate_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def store_vectors_in_db(text_chunks, source_name):
+def store_vectors_in_db(text_chunks):
     genai.configure(api_key=GEMINI_API_KEY)
 
     full_text = "\n".join(text_chunks)
     pdf_hash = generate_hash(full_text)
 
-    existing_entry = supabase.table("chunks_embedding").select("source_name").eq("source_name", source_name).execute()
+    existing_entry = supabase.table("text_embeddings").select("pdf_hash").eq("pdf_hash", pdf_hash).execute()
 
     if existing_entry.data:
         print("Duplicate PDF detected. Skipping storage.")
@@ -140,17 +138,16 @@ def store_vectors_in_db(text_chunks, source_name):
         )
         vector = response["embedding"]  
 
-        supabase.table("chunks_embedding").insert({
+        supabase.table("text_embeddings").insert({
             "text": chunk, 
             "embedding": vector,
-            "hash": pdf_hash,
-            "source_name": source_name
+            "pdf_hash": pdf_hash 
         }).execute()
 
     print("New PDF stored successfully!")
 
 
-def vectorsearch(user_query):
+def vectorsearch(user_query, pdf_hash):
     genai.configure(api_key=GEMINI_API_KEY) 
 
     response = genai.embed_content(
@@ -163,7 +160,7 @@ def vectorsearch(user_query):
         query_embedding = response["embedding"]
 
         response = supabase.rpc(
-            "match_documents",
+            "similarchuncks",
             {
                 "query_embedding": query_embedding,
                 "match_threshold": 0.5,
@@ -172,8 +169,9 @@ def vectorsearch(user_query):
         ).execute()
 
         # Filter the results to only return text from the same hash
+        filtered_results = [row["text"] for row in response.data if row["pdf_hash"] == pdf_hash]
 
-        return response
+        return filtered_results if filtered_results else []
 
     return []
 
@@ -201,9 +199,9 @@ def get_llm_chain():
     return LLMChain(llm=model, prompt=prompt)
 
 
-def user_prompt(prompt, pdf_names):
-    response = vectorsearch(prompt)  # Pass hash to filter correct results
-    relevant_chunks = [row["text"] for row in response.data if response["source_name"] not in pdf_names]
+def user_prompt(prompt, pdf_hash):
+    relevant_chunks = vectorsearch(prompt, pdf_hash)  # Pass hash to filter correct results
+    
     chain = get_llm_chain()
     
     if not relevant_chunks:
@@ -223,36 +221,30 @@ def user_prompt(prompt, pdf_names):
 def pdf_chatbot():
     st.header("📄 PDF Chatbot")
 
-    pdf_docs = st.file_uploader("Upload your PDF Files", type=["pdf"], accept_multiple_files=True, key="file_uploaded")
+    pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="file_uploded")
 
     if pdf_docs:
-        st.write("Uploaded PDF files:")
-        for pdf in pdf_docs:
-            st.write(pdf.name)  # Print the name of each uploaded PDF
-
         if not st.session_state.current_chat_id:
             generate_new_chat(pdf_docs[0].name)
 
-        chat_id = st.session_state.curr_chat_id
+        chat_id = st.session_state.current_chat_id
 
-        if not st.session_state.chat_sess[chat_id]["Chat Name"] or st.session_state.chat_sess[chat_id]["Chat Name"] != pdf_docs[0].name:
-            st.session_state.chat_sess[chat_id]["Chat Name"] = pdf_docs[0].name
-
+        if not st.session_state.chat_sessions[chat_id]["Chat Name"] or st.session_state.chat_sessions[chat_id]["Chat Name"] != pdf_docs[0].name:
+            st.session_state.chat_sessions[chat_id]["Chat Name"] = pdf_docs[0].name
         with st.spinner("Processing..."):
-            raw_texts = get_pdf_text(pdf_docs)
-            if not raw_texts:
-                st.error("No text extracted from the PDFs.")
-                return
+            raw_text = get_pdf_text(pdf_docs)
+            text_chunks = get_text_chunks(raw_text)
+            pdf_hash = generate_hash("\n".join(text_chunks))
 
-            pdf_names = []
-            for i in raw_texts:
-                pdf_names.append(i["source_name"])
-                text_chunks = get_text_chunks(i["text"])
-                store_vectors_in_db(text_chunks, i["source_name"])
+            st.session_state.chat_sessions[chat_id]["context_hash"] = pdf_hash
+            st.session_state.chat_sessions[chat_id]["context_type"] = "pdf"
 
+            # Save immediately to local storage to ensure persistence
+            unique_key = f"pdf_store_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            local_storage.setItem("chat_sessions_local", json.dumps(st.session_state.chat_sessions), key=unique_key)
+
+            store_vectors_in_db(text_chunks)
             st.success("PDF processed successfully! You can now chat with it.")
-            st.session_state.chat_sess[chat_id]["context_sources"] = pdf_names
-            st.session_state.chat_sess[chat_id]["context_type"] = "pdf"
 
     display_chat_history()
 
@@ -261,16 +253,17 @@ def pdf_chatbot():
     if user_query:
         store_message("user", user_query)
         st.chat_message("user").markdown(user_query)
-        chat_id = st.session_state.curr_chat_id
-
-        if not st.session_state.chat_sess[chat_id].get("context_sources"):
+        chat_id = st.session_state.current_chat_id
+        
+        # Check if context_hash exists
+        if not st.session_state.chat_sessions[chat_id].get("context_hash"):
             with st.chat_message("assistant"):
                 st.markdown("Please upload and process a PDF first.")
             store_message("assistant", "Please upload and process a PDF first.")
         else:
-            pdf_names = st.session_state.chat_sess[chat_id]["context_sources"]
-            bot_response = user_prompt(user_query, pdf_names)
-
+            pdf_hash = st.session_state.chat_sessions[chat_id]["context_hash"]
+            bot_response = user_prompt(user_query, pdf_hash)
+            
             if bot_response:
                 store_message("assistant", bot_response)
                 with st.chat_message("assistant"):
